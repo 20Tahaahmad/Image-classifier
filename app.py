@@ -126,3 +126,286 @@ def make_thumbnail(image_bytes, size=320):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     image.thumbnail((size, size))
     buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=80)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def format_size(num_bytes):
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def render_results(result, model, elapsed):
+    primary, aliases = split_label(result["label"])
+    confidence = float(result["confidence"])
+    level, level_text = confidence_level(confidence)
+
+    st.markdown(
+        f"""
+        <div class="result-hero">
+          <div class="gauge" style="--p:{max(0, min(100, confidence))}">
+            <div class="gauge-inner">
+              <div class="gauge-value">{confidence:.0f}%</div>
+              <div class="gauge-label">Confidence</div>
+            </div>
+          </div>
+          <div>
+            <div class="result-kicker">✓ Top prediction</div>
+            <div class="result-label">{escape(primary)}</div>
+            <div class="result-aliases">{("Also known as: " + escape(aliases)) if aliases else ""}</div>
+            <span class="confidence-tag {level}">{level_text}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="section-label">All predictions</div>', unsafe_allow_html=True)
+    for index, item in enumerate(result.get("all_results", []), start=1):
+        name, _ = split_label(item["label"])
+        pct = max(0.0, min(100.0, float(item["confidence"])))
+        st.markdown(
+            f"""
+            <div class="bar-item">
+              <div class="bar-head">
+                <span class="bar-name"><span class="bar-rank">#{index}</span>{escape(name)}</span>
+                <span class="bar-pct">{pct:.2f}%</span>
+              </div>
+              <div class="bar-track">
+                <div class="bar-fill" style="width:{max(pct, 1.5):.2f}%"></div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        f'<span class="meta-chip">⚙ {escape(str(MODELS.get(model, model)))}</span>'
+        f'<span class="meta-chip">ϟ {elapsed:.2f}s</span>'
+        f'<span class="meta-chip">◷ {datetime.now().strftime("%H:%M:%S")}</span>',
+        unsafe_allow_html=True,
+    )
+
+
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "result" not in st.session_state:
+    st.session_state.result = None
+if "model" not in st.session_state:
+    st.session_state.model = DEFAULT_MODEL
+if "last_upload_id" not in st.session_state:
+    st.session_state.last_upload_id = None
+
+# Navigation / brand
+nav_left, nav_right = st.columns([3, 1])
+with nav_left:
+    st.markdown(
+        '<div class="brand"><div class="brand-logo">◉</div><div>AI Image Classifier'
+        '<span class="brand-sub">Powered by Hugging Face</span></div></div>',
+        unsafe_allow_html=True,
+    )
+with nav_right:
+    st.markdown(
+        '<div style="text-align:right;padding-top:10px"><span class="status-pill">'
+        '<span class="status-dot"></span>Ready · Hugging Face</span></div>',
+        unsafe_allow_html=True,
+    )
+
+st.markdown(
+    '<div class="hero"><div class="eyebrow">✦ Vision Transformers · Image inference</div>'
+    '<div class="hero-title">See the world through <span class="gradient-text">AI eyes</span></div>'
+    '<div class="hero-sub">Drop in any photo and state-of-the-art vision models will identify '
+    'what’s in it, ranked by confidence, in seconds.</div></div>',
+    unsafe_allow_html=True,
+)
+
+# Statistics
+history = st.session_state.history
+average_confidence = (
+    sum(float(item["confidence"]) for item in history) / len(history)
+    if history else None
+)
+stat1, stat2, stat3 = st.columns(3)
+with stat1:
+    st.markdown(
+        f'<div class="stat-card"><div class="stat-icon">▧</div><div>'
+        f'<div class="stat-value">{len(history)}</div><div class="stat-label">Images analyzed</div></div></div>',
+        unsafe_allow_html=True,
+    )
+with stat2:
+    avg_text = f"{average_confidence:.1f}%" if average_confidence is not None else "--"
+    st.markdown(
+        f'<div class="stat-card"><div class="stat-icon">↗</div><div>'
+        f'<div class="stat-value">{avg_text}</div><div class="stat-label">Avg confidence</div></div></div>',
+        unsafe_allow_html=True,
+    )
+with stat3:
+    active_model_name = MODELS.get(st.session_state.model, st.session_state.model)
+    st.markdown(
+        f'<div class="stat-card"><div class="stat-icon">⚙</div><div>'
+        f'<div class="stat-value">{escape(str(active_model_name))}</div>'
+        f'<div class="stat-label">Active model</div></div></div>',
+        unsafe_allow_html=True,
+    )
+
+left_col, right_col = st.columns([5, 7], gap="large")
+
+with left_col:
+    st.markdown(
+        '<div class="glass-card"><div class="card-head">'
+        '<div class="card-title">⇧ Upload image</div><span class="step-badge">Step 1</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    uploaded_file = st.file_uploader(
+        "Drop your image here or browse",
+        type=["png", "jpg", "jpeg", "webp", "gif"],
+        accept_multiple_files=False,
+        help="PNG, JPG, WEBP, GIF · up to 10 MB",
+    )
+
+    upload_valid = False
+    image_bytes = None
+    if uploaded_file is not None:
+        image_bytes = uploaded_file.getvalue()
+        if len(image_bytes) > MAX_UPLOAD_BYTES:
+            st.error("The image exceeds the 10 MB limit. Please choose a smaller image.")
+        else:
+            try:
+                with Image.open(io.BytesIO(image_bytes)) as preview_image:
+                    preview_image.load()
+                    width, height = preview_image.size
+                    st.image(preview_image, caption=uploaded_file.name, use_container_width=True)
+                st.caption(
+                    f"{uploaded_file.name} · {format_size(len(image_bytes))} · {width} × {height}"
+                )
+                upload_valid = True
+            except Exception:
+                st.error("This file could not be read as an image.")
+
+    model_ids = list(MODELS.keys())
+    if not model_ids:
+        st.error("No models are configured in huggingface.api_client.")
+        st.stop()
+    default_index = model_ids.index(DEFAULT_MODEL) if DEFAULT_MODEL in model_ids else 0
+    selected_model = st.selectbox(
+        "Model",
+        options=model_ids,
+        index=default_index,
+        format_func=lambda model_id: MODELS.get(model_id, model_id),
+    )
+    st.session_state.model = selected_model
+
+    button_col, clear_col = st.columns([4, 1])
+    with button_col:
+        classify_clicked = st.button(
+            "✦  Classify image",
+            type="primary",
+            use_container_width=True,
+            disabled=not upload_valid,
+        )
+    with clear_col:
+        clear_clicked = st.button("✕", use_container_width=True, help="Clear image and result")
+
+    if clear_clicked:
+        st.session_state.result = None
+        st.session_state.last_upload_id = None
+        st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if classify_clicked and upload_valid and image_bytes is not None:
+        try:
+            with st.spinner("Analyzing image…"):
+                started = time.perf_counter()
+                raw_results = classify_image(image_bytes, model=selected_model)
+                elapsed = time.perf_counter() - started
+                classification = get_classification_result(raw_results)
+
+            st.session_state.result = {
+                "data": classification,
+                "model": selected_model,
+                "elapsed": elapsed,
+                "filename": uploaded_file.name,
+            }
+
+            history_entry = {
+                "thumb": make_thumbnail(image_bytes),
+                "label": split_label(classification["label"])[0],
+                "confidence": float(classification["confidence"]),
+                "model": MODELS.get(selected_model, selected_model),
+                "filename": uploaded_file.name,
+                "time": datetime.now().strftime("%H:%M"),
+            }
+            st.session_state.history = (
+                [history_entry] + st.session_state.history
+            )[:MAX_HISTORY]
+            st.rerun()
+        except Exception as error:
+            st.error(
+                "We couldn't classify this image. Try again or pick another model. "
+                f"Details: {error}"
+            )
+
+with right_col:
+    st.markdown(
+        '<div class="glass-card"><div class="card-head">'
+        '<div class="card-title">◎ Results</div><span class="step-badge">Step 2</span></div>',
+        unsafe_allow_html=True,
+    )
+    current_result = st.session_state.result
+    if current_result is None:
+        st.markdown(
+            '<div style="text-align:center;padding:3.5rem 1rem;color:#a9b4d0">'
+            '<div style="font-size:3rem;margin-bottom:12px">✧</div>'
+            '<div style="font-size:1.2rem;font-weight:800;color:#f2f4ff">Waiting for an image</div>'
+            '<div style="max-width:380px;margin:8px auto;line-height:1.7">'
+            'Upload a photo and hit Classify. The AI will tell you what it sees and how confident it is.'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        render_results(
+            current_result["data"],
+            current_result["model"],
+            current_result["elapsed"],
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Recent history
+st.markdown('<div style="height:20px"></div>', unsafe_allow_html=True)
+history_title_col, history_button_col = st.columns([4, 1])
+with history_title_col:
+    st.markdown('<div class="card-title">◷ Recent classifications</div>', unsafe_allow_html=True)
+with history_button_col:
+    if st.button("🗑 Clear history", use_container_width=True):
+        st.session_state.history = []
+        st.rerun()
+
+history = st.session_state.history
+if not history:
+    st.info("No images classified yet. Your results will appear here.")
+else:
+    history_columns = st.columns(3)
+    for index, item in enumerate(history):
+        with history_columns[index % 3]:
+            st.markdown('<div class="history-card">', unsafe_allow_html=True)
+            st.image(item["thumb"], use_container_width=True)
+            st.markdown(
+                f'<div class="history-label">{escape(str(item["label"]))}</div>'
+                f'<div class="history-meta"><span class="history-pct">{float(item["confidence"]):.1f}%</span>'
+                f'<span>{escape(str(item["time"]))}</span></div>'
+                f'<div class="history-meta"><span>{escape(str(item["model"]))}</span></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown(
+    '<div class="site-footer">Built with Streamlit · Models from '
+    '<a href="https://huggingface.co" target="_blank">Hugging Face</a></div>',
+    unsafe_allow_html=True,
+)
